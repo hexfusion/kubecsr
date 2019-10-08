@@ -185,3 +185,7 @@
 [[override]]
   name = "github.com/google/certificate-transparency-go"
   revision = "5ab67e519c93568ac3ee50fd6772a5bcf8aa460d"
+
+[[constraint]]
+  name = "github.com/prometheus/common"
+  version = "0.7.0"
