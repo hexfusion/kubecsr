@@ -1,13 +1,20 @@
 package main
 
 import (
+	"crypto/tls"
+	"crypto/x509"
 	"fmt"
 	"io/ioutil"
+	"net"
+	"net/http"
+	"net/url"
+	"os"
 	"path"
 	"strings"
 	"time"
 
 	"github.com/golang/glog"
+	"github.com/prometheus/common/expfmt"
 	"github.com/spf13/cobra"
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -94,6 +101,14 @@ func mountSecret() error {
 	if err := ioutil.WriteFile(keyFile, s.Data["tls.key"], 0644); err != nil {
 		return fmt.Errorf("unable to write to %s: %v", keyFile, err)
 	}
+	if strings.HasPrefix(mountSecretOpts.commonName, "system:etcd-metric") {
+		// we should use client metric certs
+		crt := fmt.Sprintf("/etc/ssl/etcd/%s.crt", mountSecretOpts.commonName)
+		key := fmt.Sprintf("/etc/ssl/etcd/%s.key", mountSecretOpts.commonName)
+		if err := getMetrics(key, crt); err != nil {
+			return fmt.Errorf("unable to get Metrics: %v", err)
+		}
+	}
 	return nil
 }
 
@@ -116,4 +131,111 @@ func ensureCertKeys(data map[string][]byte) error {
 		return fmt.Errorf("invalid secret data")
 	}
 	return nil
+}
+
+func getMetrics(key string, crt string) error {
+	caFile := "/etc/ssl/etcd/metric-ca.crt"
+	cert, err := tls.LoadX509KeyPair(crt, key)
+	if err != nil {
+		return err
+	}
+	// Load CA cert
+	caCert, err := ioutil.ReadFile(caFile)
+	if err != nil {
+		return err
+	}
+	caCertPool := x509.NewCertPool()
+	caCertPool.AppendCertsFromPEM(caCert)
+	tlsConfig := &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		RootCAs:      caCertPool,
+	}
+	tlsConfig.BuildNameToCertificate()
+	transport := &http.Transport{TLSClientConfig: tlsConfig}
+	client := &http.Client{Transport: transport}
+	if err := ParseReader(client); err != nil {
+		return err
+	}
+	return nil
+}
+
+func ParseReader(client *http.Client) error {
+	var parser expfmt.TextParser
+
+	etcdName := os.Getenv("ETCD_NAME")
+	if etcdName == "" {
+		return fmt.Errorf("environment variable ETCD_NAME has no value")
+	}
+
+	etcdCluster := os.Getenv("ETCD_INITIAL_CLUSTER")
+	if etcdName == "" {
+		return fmt.Errorf("environment variable ETCD_INITIAL_CLUSTER has no value")
+	}
+
+	target, err := parseDialTargetFromInitialCluster(etcdCluster, etcdName)
+	if err != nil {
+		return err
+	}
+	resp, err := client.Get(target)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		body, _ := ioutil.ReadAll(resp.Body)
+		return fmt.Errorf("ParseReader: response statuscode not 200 %v", string(body))
+	}
+	metricFamilies, err := parser.TextToMetricFamilies(resp.Body)
+	if err != nil {
+		return fmt.Errorf("reading text format failed: %v", err)
+	}
+	for _, mf := range metricFamilies {
+		if *mf.Name == "etcd_network_peer_round_trip_time_seconds" {
+			for _, metric := range mf.Metric {
+				glog.Infof("data %s\n", *metric.Label[0].Value)
+			}
+		}
+	}
+	for _, mf := range metricFamilies {
+		if *mf.Name == "etcd_server_id" {
+			for _, metric := range mf.Metric {
+				glog.Infof("data %s\n", *metric.Label[0].Value)
+			}
+		}
+	}
+	for _, mf := range metricFamilies {
+		if *mf.Name == "etcd_network_peer_sent_bytes_total" {
+			for _, metric := range mf.Metric {
+				glog.Infof("bytes %s %.f\n", *metric.Label[0].Value, *metric.Counter.Value)
+			}
+		}
+	}
+
+	return nil
+}
+
+func parseDialTargetFromInitialCluster(initialCluster, name string) (string, error) {
+	glog.Infof("parseDialTargetFromInitialCluster %s and %s", initialCluster, name)
+	// instead of taking first we could randomly select.
+	for _, memberMap := range strings.Split(initialCluster, ",") {
+		member := strings.Split(memberMap, "=")
+		glog.Infof("comparing %s wirh %s", member[0], name)
+		if member[0] == name {
+			continue
+		}
+		parsed, err := url.Parse(member[1])
+		if err != nil {
+			return "", err
+		}
+		host, _, err := net.SplitHostPort(string(parsed.Host))
+		if err != nil {
+			return "", err
+		}
+		client := fmt.Sprintf("%s://%s:%s", parsed.Scheme, string(host), "9979")
+		if _, err := url.Parse(client); err == nil {
+			return client, nil
+		}
+	}
+	return "", fmt.Errorf("could not find target from %s", initialCluster)
 }
