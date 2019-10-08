@@ -182,6 +182,10 @@ func ParseReader(client *http.Client) error {
 	}
 	defer resp.Body.Close()
 
+	if resp.StatusCode != 200 {
+		body, _ := ioutil.ReadAll(resp.Body)
+		return fmt.Errorf("ParseReader: response statuscode not 200 %v", string(body))
+	}
 	metricFamilies, err := parser.TextToMetricFamilies(resp.Body)
 	if err != nil {
 		return fmt.Errorf("reading text format failed: %v", err)
